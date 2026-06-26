@@ -1,12 +1,17 @@
 """
-JM regime strategy with AR as an input feature (not a post-hoc gate).
+v2 backup — 2×2 AR × JM grid (JM-only features + separate AR axis at backtest).
 
-AR and AR_zscore are included in the Jump Model feature matrix. The backtest
-is binary: bull → 100% SPY, bear → cash.
+Run:  python main2.py
+Snapshots: src/backtest2.py, src/features2.py, output_v2/
+At runtime main2 imports live src/backtest.py (same as backtest2 when saved).
 
-Backups:
-  v1 — main1.py,  src/backtest1.py,  src/features1.py,  output_v1/
-  v2 — main2.py,  src/backtest2.py,  src/features2.py,  output_v2/  (2×2 grid)
+JM is fit on SPY microstructure features only (no AR). AR z-score provides
+a separate fragility axis at backtest time:
+
+    bull + stable  → 1.0    bull + fragile → 0.5
+    bear + stable  → 0.0    bear + fragile → 0.0
+
+Other backups: v1 → main1.py, output_v1/  |  current → python main.py
 """
 
 import os
@@ -23,9 +28,14 @@ np.random.seed(42)
 
 from src.data_loader import load_etf_data
 from src.absorption_ratio import compute_ar, compute_ar_zscore
-from src.features import build_features
+from src.features import build_features_jm_only
 from src.jump_model import run_walk_forward_cv
-from src.backtest import run_backtest, plot_results
+from src.backtest import (
+    run_backtest,
+    run_backtest_2x2,
+    grid_cell_counts,
+    plot_results,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -39,6 +49,7 @@ SECTOR_TICKERS = ['XLB', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLV'
 AR_WINDOW        = 126
 AR_N_COMPONENTS  = 2
 AR_ZSCORE_WINDOW = 126
+AR_THRESHOLD     = 1.0
 
 LOOKBACK_YEARS     = 3
 LOOKBACK_DAYS      = LOOKBACK_YEARS * 252
@@ -56,7 +67,7 @@ adj, log_rets = load_etf_data(DATA_PATH)
 print(f'Loaded: {adj.shape[0]} trading days, {adj.shape[1]} tickers')
 
 # ---------------------------------------------------------------------------
-# 2. Compute Absorption Ratio
+# 2. Absorption Ratio (fragility axis — separate from JM)
 # ---------------------------------------------------------------------------
 print('\n=== Step 2: Computing Absorption Ratio ===')
 ar = compute_ar(
@@ -69,13 +80,13 @@ ar_zscore = compute_ar_zscore(ar, fast_window=15, slow_window=AR_ZSCORE_WINDOW)
 print(f'AR computed: {ar.notna().sum()} valid observations')
 
 # ---------------------------------------------------------------------------
-# 3. Build feature matrix (AR + AR_zscore inside JM features)
+# 3. JM feature matrix (no AR — independent trend axis)
 # ---------------------------------------------------------------------------
-print('\n=== Step 3: Building feature matrix (with AR) ===')
-features = build_features(adj, log_rets, ar, ar_zscore)
+print('\n=== Step 3: Building JM-only feature matrix ===')
+features_jm = build_features_jm_only(adj, log_rets)
 print(
-    f'Feature matrix: {features.shape}, '
-    f'from {features.index[0].date()} to {features.index[-1].date()}'
+    f'Feature matrix: {features_jm.shape}, '
+    f'from {features_jm.index[0].date()} to {features_jm.index[-1].date()}'
 )
 
 # ---------------------------------------------------------------------------
@@ -83,7 +94,7 @@ print(
 # ---------------------------------------------------------------------------
 print('\n=== Step 4: Walk-forward cross-validation (this may take a while) ===')
 regime = run_walk_forward_cv(
-    feature_df=features,
+    feature_df=features_jm,
     spy_returns=log_rets['SPY'],
     lookback_days=LOOKBACK_DAYS,
     lambda_candidates=LAMBDA_CANDIDATES,
@@ -98,15 +109,32 @@ print(
 )
 
 # ---------------------------------------------------------------------------
-# 5. Backtest — binary JM (no AR gate)
+# 5. Backtest — 2×2 grid + binary JM baseline
 # ---------------------------------------------------------------------------
 print('\n=== Step 5: Backtest ===')
+
+# Binary JM baseline (bear → cash, bull → full) for comparison
 strat_ret, bnh_ret, strat_m, bnh_m = run_backtest(regime, log_rets['SPY'])
+
+# 2×2 grid: JM trend × AR fragility
+grid_ret, _, grid_m, _, position = run_backtest_2x2(
+    regime,
+    log_rets['SPY'],
+    ar_zscore=ar_zscore,
+    ar_threshold=AR_THRESHOLD,
+)
+
+cell_counts = grid_cell_counts(regime, ar_zscore, ar_threshold=AR_THRESHOLD)
+print('\n=== 2×2 Grid cell occupancy (lagged) ===')
+print(cell_counts.to_string())
+print(f'\nDays at 0.5 exposure: {(position == 0.5).sum()}')
+print(f'Days at 1.0 exposure: {(position == 1.0).sum()}')
+print(f'Days at 0.0 exposure: {(position == 0.0).sum()}')
 
 # ---------------------------------------------------------------------------
 # 6. Print metrics
 # ---------------------------------------------------------------------------
-metrics_df = pd.DataFrame([strat_m, bnh_m]).set_index('Label')
+metrics_df = pd.DataFrame([strat_m, grid_m, bnh_m]).set_index('Label')
 print('\n=== Performance Metrics ===')
 print(metrics_df.to_string())
 
@@ -123,8 +151,10 @@ print(f'  Number of switches: {(regime.diff().abs().dropna() > 0).sum()}')
 print(f'\n=== Step 7: Saving outputs to {OUTPUT_PATH} ===')
 os.makedirs(OUTPUT_PATH, exist_ok=True)
 regime.to_csv(OUTPUT_PATH + 'regime_series.csv')
+position.to_csv(OUTPUT_PATH + 'position_series.csv')
 metrics_df.to_csv(OUTPUT_PATH + 'metrics.csv')
-print('Saved: regime_series.csv, metrics.csv')
+cell_counts.to_csv(OUTPUT_PATH + 'grid_cell_counts.csv')
+print('Saved: regime_series.csv, position_series.csv, metrics.csv, grid_cell_counts.csv')
 
 # ---------------------------------------------------------------------------
 # 8. Plot
@@ -134,6 +164,8 @@ plot_results(
     strat_ret,
     bnh_ret,
     regime,
+    gated_returns=grid_ret,
+    gated_label='2×2 Grid',
     save_path=OUTPUT_PATH + 'equity_curves.png',
 )
 print('Saved: equity_curves.png')

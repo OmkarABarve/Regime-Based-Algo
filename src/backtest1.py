@@ -5,14 +5,6 @@ import pandas as pd
 
 from src.utils import compute_metrics, max_drawdown
 
-# 2×2 grid: (JM bull/bear, AR stable/fragile) → SPY weight
-DEFAULT_GRID_ALLOC = {
-    (1, False): 1.0,  # bull + stable
-    (1, True):  0.5,  # bull + fragile
-    (0, False): 0.0,  # bear + stable
-    (0, True):  0.0,  # bear + fragile
-}
-
 
 def run_backtest(
     regime_series: pd.Series,
@@ -81,100 +73,6 @@ def run_backtest(
     bnh_metrics = compute_metrics(bnh_returns, 'Buy & Hold')
 
     return strategy_returns, bnh_returns, strategy_metrics, bnh_metrics
-
-
-def run_backtest_2x2(
-    regime_series: pd.Series,
-    spy_returns: pd.Series,
-    ar_zscore: pd.Series,
-    ar_threshold: float = 1.0,
-    grid_alloc: dict = None,
-) -> tuple:
-    """
-    Run a 2×2 AR × JM grid backtest with graded position sizing.
-
-    JM (trend) and AR (fragility) are combined independently:
-
-        |              | AR stable | AR fragile |
-        |--------------|-----------|------------|
-        | JM bull      | 1.0       | 0.5        |
-        | JM bear      | 0.0       | 0.0        |
-
-    No look-ahead: both regime and AR z-score are shifted by one day before
-    sizing the position held from open of t+1.
-
-    Parameters
-    ----------
-    regime_series : pd.Series
-        Daily JM regime labels (1=bull, 0=bear). Should be fit on JM-only
-        features (no AR columns) for a clean 2×2 split.
-    spy_returns : pd.Series
-        Daily SPY log returns.
-    ar_zscore : pd.Series
-        Daily absorption-ratio z-score (fragility signal).
-    ar_threshold : float, default 1.0
-        Values above this mark AR as fragile.
-    grid_alloc : dict, optional
-        Mapping ``(jm_bull: int, ar_fragile: bool)`` → position weight.
-        Defaults to ``DEFAULT_GRID_ALLOC``.
-
-    Returns
-    -------
-    strategy_returns, bnh_returns, strategy_metrics, bnh_metrics
-    position_series : pd.Series — daily position weights (for diagnostics)
-    """
-    if grid_alloc is None:
-        grid_alloc = DEFAULT_GRID_ALLOC
-
-    common = regime_series.index.intersection(spy_returns.index)
-    regime_aligned = regime_series.loc[common]
-    spy_aligned = spy_returns.loc[common]
-
-    regime_lag = regime_aligned.shift(1).fillna(0).astype(int)
-    ar_shifted = ar_zscore.reindex(common).shift(1)
-    ar_fragile = (ar_shifted > ar_threshold).fillna(False)
-
-    position = pd.Series(0.0, index=common)
-    bull = regime_lag == 1
-    position[bull & ~ar_fragile] = grid_alloc[(1, False)]
-    position[bull & ar_fragile] = grid_alloc[(1, True)]
-
-    strategy_returns = position * spy_aligned
-    bnh_returns = spy_aligned.copy()
-
-    strategy_metrics = compute_metrics(strategy_returns, '2×2 Grid')
-    bnh_metrics = compute_metrics(bnh_returns, 'Buy & Hold')
-
-    return strategy_returns, bnh_returns, strategy_metrics, bnh_metrics, position
-
-
-def grid_cell_counts(
-    regime_series: pd.Series,
-    ar_zscore: pd.Series,
-    ar_threshold: float = 1.0,
-) -> pd.Series:
-    """Count days in each 2×2 cell (after the 1-day lag)."""
-    common = regime_series.index.intersection(ar_zscore.index)
-    regime_lag = regime_series.loc[common].shift(1).fillna(0).astype(int)
-    ar_shifted = ar_zscore.reindex(common).shift(1)
-    ar_fragile = ar_shifted > ar_threshold
-
-    labels = []
-    for date in common:
-        jm = int(regime_lag.loc[date])
-        frag = bool(ar_fragile.loc[date]) if pd.notna(ar_fragile.loc[date]) else False
-        if jm == 1 and not frag:
-            labels.append('bull_stable')
-        elif jm == 1 and frag:
-            labels.append('bull_fragile')
-        elif jm == 0 and not frag:
-            labels.append('bear_stable')
-        else:
-            labels.append('bear_fragile')
-
-    counts = pd.Series(labels).value_counts()
-    counts.index.name = 'cell'
-    return counts
 
 
 def plot_results(
