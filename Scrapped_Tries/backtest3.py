@@ -3,7 +3,7 @@ import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 
-from src.utils import compute_metrics, max_drawdown, slice_oos
+from src.utils import compute_metrics, max_drawdown
 
 # 2×2 grid: (JM bull/bear, AR stable/fragile) → SPY weight
 DEFAULT_GRID_ALLOC = {
@@ -14,28 +14,11 @@ DEFAULT_GRID_ALLOC = {
 }
 
 
-def _apply_oos_window(
-    strategy_returns: pd.Series,
-    bnh_returns: pd.Series,
-    oos_start: str = None,
-    oos_end: str = None,
-) -> tuple:
-    """Clip strategy and B&H return series to the common evaluation window."""
-    if oos_start is None and oos_end is None:
-        return strategy_returns, bnh_returns
-    return (
-        slice_oos(strategy_returns, oos_start, oos_end),
-        slice_oos(bnh_returns, oos_start, oos_end),
-    )
-
-
 def run_backtest(
     regime_series: pd.Series,
     spy_returns: pd.Series,
     ar_zscore: pd.Series = None,
     ar_threshold: float = 1.0,
-    oos_start: str = None,
-    oos_end: str = None,
 ) -> tuple:
     """
     Run a regime-following backtest against SPY buy-and-hold, with optional
@@ -66,9 +49,6 @@ def run_backtest(
         Daily absorption-ratio z-score. If provided, enables AR gating.
     ar_threshold : float, default 1.0
         Z-score level above which a bull-regime position is halved to 0.5.
-    oos_start, oos_end : str or None
-        If set, clip returns to this evaluation window before metrics
-        (see ``src.config.OOS_START``).
 
     Returns
     -------
@@ -97,10 +77,6 @@ def run_backtest(
     strategy_returns = position * spy_aligned
     bnh_returns = spy_aligned.copy()
 
-    strategy_returns, bnh_returns = _apply_oos_window(
-        strategy_returns, bnh_returns, oos_start, oos_end
-    )
-
     strategy_metrics = compute_metrics(strategy_returns, label)
     bnh_metrics = compute_metrics(bnh_returns, 'Buy & Hold')
 
@@ -113,8 +89,6 @@ def run_backtest_2x2(
     ar_zscore: pd.Series,
     ar_threshold: float = 1.0,
     grid_alloc: dict = None,
-    oos_start: str = None,
-    oos_end: str = None,
 ) -> tuple:
     """
     Run a 2×2 AR × JM grid backtest with graded position sizing.
@@ -143,8 +117,6 @@ def run_backtest_2x2(
     grid_alloc : dict, optional
         Mapping ``(jm_bull: int, ar_fragile: bool)`` → position weight.
         Defaults to ``DEFAULT_GRID_ALLOC``.
-    oos_start, oos_end : str or None
-        Common evaluation window clip (see ``src.config``).
 
     Returns
     -------
@@ -169,11 +141,6 @@ def run_backtest_2x2(
 
     strategy_returns = position * spy_aligned
     bnh_returns = spy_aligned.copy()
-
-    strategy_returns, bnh_returns = _apply_oos_window(
-        strategy_returns, bnh_returns, oos_start, oos_end
-    )
-    position = slice_oos(position, oos_start, oos_end)
 
     strategy_metrics = compute_metrics(strategy_returns, '2×2 Grid')
     bnh_metrics = compute_metrics(bnh_returns, 'Buy & Hold')
@@ -210,291 +177,6 @@ def grid_cell_counts(
     return counts
 
 
-def compute_asymmetric_position(
-    regime_series: pd.Series,
-    ar_zscore: pd.Series,
-    ar_exit_high: float = 1.0,
-    ar_entry_low: float = 0.0,
-    ar_slope_days: int = 2,
-    exit_persist_days: int = 3,
-    bull_floor: float = 0.5,
-) -> pd.Series:
-    """
-    Two-stage asymmetric position sizing: JM primary, AR one-sided overlay.
-
-    Signals at close of day t set position held from open of t+1.
-    AR may accelerate exits (→0) but never force longs without JM bull.
-
-    Rules (evaluated in order each day):
-      1. JM bearish                                    → 0
-      2. JM bullish, AR high and (rising | persist)    → 0
-      3. JM bullish and AR below entry low (calm)      → 1
-      4. JM bullish (otherwise)                        → bull_floor (default 0.5)
-
-    Step 4 replaces the old "hold prior" rule so JM bull always re-enters
-    at least at ``bull_floor`` — AR only blocks full size, not participation.
-
-    Parameters
-    ----------
-    ar_slope_days : int
-        Short lookback for AR rising exit trigger (smaller = faster exit).
-    bull_floor : float
-        Minimum exposure when JM is bull but AR has not yet calmed.
-    """
-    common = regime_series.index.intersection(ar_zscore.index)
-    regime = regime_series.reindex(common).astype(float)
-    ar = ar_zscore.reindex(common)
-
-    position = pd.Series(0.0, index=common)
-    prev_pos = 0.0
-
-    for t in range(len(common)):
-        if t == 0:
-            position.iloc[t] = 0.0
-            prev_pos = 0.0
-            continue
-
-        sig_idx = t - 1
-        jm_bull = regime.iloc[sig_idx] == 1
-
-        if not jm_bull:
-            new_pos = 0.0
-        else:
-            ar_val = ar.iloc[sig_idx]
-            if pd.notna(ar_val) and _ar_exit_trigger(
-                ar, sig_idx, ar_exit_high, ar_slope_days, exit_persist_days
-            ):
-                new_pos = 0.0
-            elif pd.notna(ar_val) and ar_val < ar_entry_low:
-                new_pos = 1.0
-            else:
-                new_pos = bull_floor
-
-        position.iloc[t] = new_pos
-        prev_pos = new_pos
-
-    return position
-
-
-def _ar_exit_trigger(
-    ar: pd.Series,
-    idx: int,
-    exit_high: float,
-    slope_days: int,
-    persist_days: int,
-) -> bool:
-    """True when AR z-score signals fragility (high + rising or persistent)."""
-    ar_val = ar.iloc[idx]
-    if pd.isna(ar_val) or ar_val <= exit_high:
-        return False
-
-    rising = False
-    if idx >= slope_days and pd.notna(ar.iloc[idx - slope_days]):
-        rising = ar_val > ar.iloc[idx - slope_days]
-
-    persist = False
-    if idx >= persist_days - 1:
-        window = ar.iloc[idx - persist_days + 1: idx + 1]
-        persist = (window > exit_high).all()
-
-    return rising or persist
-
-
-def run_backtest_asymmetric(
-    regime_series: pd.Series,
-    spy_returns: pd.Series,
-    ar_zscore: pd.Series,
-    ar_exit_high: float = 1.0,
-    ar_entry_low: float = 0.0,
-    ar_slope_days: int = 2,
-    exit_persist_days: int = 3,
-    bull_floor: float = 0.5,
-    strategy_label: str = 'JM + AR Asymmetric',
-    oos_start: str = None,
-    oos_end: str = None,
-) -> tuple:
-    """
-    Backtest the two-stage asymmetric JM + AR fragility overlay.
-
-    Parameters
-    ----------
-    oos_start, oos_end : str or None
-        Common evaluation window clip (see ``src.config``).
-
-    Returns
-    -------
-    strategy_returns, bnh_returns, strategy_metrics, bnh_metrics, position
-    """
-    common = regime_series.index.intersection(spy_returns.index)
-    spy_aligned = spy_returns.loc[common]
-
-    position = compute_asymmetric_position(
-        regime_series,
-        ar_zscore,
-        ar_exit_high=ar_exit_high,
-        ar_entry_low=ar_entry_low,
-        ar_slope_days=ar_slope_days,
-        exit_persist_days=exit_persist_days,
-        bull_floor=bull_floor,
-    )
-    position = position.reindex(common).fillna(0.0)
-
-    strategy_returns = position * spy_aligned
-    bnh_returns = spy_aligned.copy()
-
-    strategy_returns, bnh_returns = _apply_oos_window(
-        strategy_returns, bnh_returns, oos_start, oos_end
-    )
-    position = slice_oos(position, oos_start, oos_end)
-
-    strategy_metrics = compute_metrics(strategy_returns, strategy_label)
-    bnh_metrics = compute_metrics(bnh_returns, 'Buy & Hold')
-
-    return strategy_returns, bnh_returns, strategy_metrics, bnh_metrics, position
-
-
-def compute_cascade_position(
-    regime_series: pd.Series,
-    ar_zscore: pd.Series,
-    ar_exit_high: float = 1.0,
-    ar_entry_low: float = 0.0,
-    ar_slope_days: int = 2,
-    exit_persist_days: int = 3,
-) -> pd.Series:
-    """
-    Binary AR-first cascade + JM (v6). Strict 0/1 only — no partial sizing.
-
-    Signals at close of day t set position held from open of t+1.
-    Evaluation order (AR fragility checked before JM can go long):
-
-      1. AR veto (z-score > exit_high, or high + rising | persist)  → 0
-      2. JM bearish                                                 → 0
-      3. JM bullish and not AR veto                                 → 1
-
-    Strict binary: only 0 or 1. ``ar_entry_low`` is reserved for future
-    hysteresis; long requires JM bull and no AR veto.
-    """
-    common = regime_series.index.intersection(ar_zscore.index)
-    regime = regime_series.reindex(common).astype(float)
-    ar = ar_zscore.reindex(common)
-
-    position = pd.Series(0.0, index=common)
-
-    for t in range(len(common)):
-        if t == 0:
-            position.iloc[t] = 0.0
-            continue
-
-        sig_idx = t - 1
-        jm_bull = regime.iloc[sig_idx] == 1
-        ar_val = ar.iloc[sig_idx]
-
-        ar_veto = False
-        if pd.notna(ar_val):
-            ar_veto = (
-                ar_val > ar_exit_high
-                or _ar_exit_trigger(
-                    ar, sig_idx, ar_exit_high, ar_slope_days, exit_persist_days
-                )
-            )
-
-        if ar_veto:
-            new_pos = 0.0
-        elif not jm_bull:
-            new_pos = 0.0
-        else:
-            new_pos = 1.0
-
-        position.iloc[t] = new_pos
-
-    return position
-
-
-def cascade_cell_counts(
-    regime_series: pd.Series,
-    ar_zscore: pd.Series,
-    ar_exit_high: float = 1.0,
-    ar_entry_low: float = 0.0,
-    ar_slope_days: int = 2,
-    exit_persist_days: int = 3,
-) -> pd.Series:
-    """Count days by cascade outcome (signals at t-1 for position at t)."""
-    common = regime_series.index.intersection(ar_zscore.index)
-    regime = regime_series.reindex(common).astype(float)
-    ar = ar_zscore.reindex(common)
-
-    labels = []
-    for t in range(len(common)):
-        if t == 0:
-            labels.append('cash')
-            continue
-        sig_idx = t - 1
-        jm_bull = regime.iloc[sig_idx] == 1
-        ar_val = ar.iloc[sig_idx]
-        ar_veto = False
-        if pd.notna(ar_val):
-            ar_veto = (
-                ar_val > ar_exit_high
-                or _ar_exit_trigger(
-                    ar, sig_idx, ar_exit_high, ar_slope_days, exit_persist_days
-                )
-            )
-        if ar_veto:
-            labels.append('ar_veto')
-        elif not jm_bull:
-            labels.append('jm_bear')
-        else:
-            labels.append('long')
-
-    return pd.Series(labels, index=common).value_counts()
-
-
-def run_backtest_cascade(
-    regime_series: pd.Series,
-    spy_returns: pd.Series,
-    ar_zscore: pd.Series,
-    ar_exit_high: float = 1.0,
-    ar_entry_low: float = 0.0,
-    ar_slope_days: int = 2,
-    exit_persist_days: int = 3,
-    strategy_label: str = 'v6 AR-first Cascade',
-    oos_start: str = None,
-    oos_end: str = None,
-) -> tuple:
-    """
-    Backtest binary AR-first cascade + JM-only regime.
-
-    Returns
-    -------
-    strategy_returns, bnh_returns, strategy_metrics, bnh_metrics, position
-    """
-    common = regime_series.index.intersection(spy_returns.index)
-    spy_aligned = spy_returns.loc[common]
-
-    position = compute_cascade_position(
-        regime_series,
-        ar_zscore,
-        ar_exit_high=ar_exit_high,
-        ar_entry_low=ar_entry_low,
-        ar_slope_days=ar_slope_days,
-        exit_persist_days=exit_persist_days,
-    )
-    position = position.reindex(common).fillna(0.0)
-
-    strategy_returns = position * spy_aligned
-    bnh_returns = spy_aligned.copy()
-
-    strategy_returns, bnh_returns = _apply_oos_window(
-        strategy_returns, bnh_returns, oos_start, oos_end
-    )
-    position = slice_oos(position, oos_start, oos_end)
-
-    strategy_metrics = compute_metrics(strategy_returns, strategy_label)
-    bnh_metrics = compute_metrics(bnh_returns, 'Buy & Hold')
-
-    return strategy_returns, bnh_returns, strategy_metrics, bnh_metrics, position
-
-
 def plot_results(
     strategy_returns: pd.Series,
     bnh_returns: pd.Series,
@@ -502,8 +184,6 @@ def plot_results(
     gated_returns: pd.Series = None,
     gated_label: str = 'JM + AR Gate',
     save_path: str = None,
-    oos_start: str = None,
-    oos_end: str = None,
 ) -> None:
     """
     Produce a 3-panel figure:
@@ -521,14 +201,7 @@ def plot_results(
                        returns are overlaid on the equity and drawdown panels
     gated_label      : str — legend label for the AR-gated series
     save_path        : str or None — if provided, save the figure to this path
-    oos_start, oos_end : str or None — clip all series to evaluation window
     """
-    strategy_returns = slice_oos(strategy_returns, oos_start, oos_end)
-    bnh_returns = slice_oos(bnh_returns, oos_start, oos_end)
-    regime_series = slice_oos(regime_series, oos_start, oos_end)
-    if gated_returns is not None:
-        gated_returns = slice_oos(gated_returns, oos_start, oos_end)
-
     fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
 
     # ---- Equity curves ------------------------------------------------

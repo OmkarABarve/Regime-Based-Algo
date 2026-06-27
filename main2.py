@@ -36,13 +36,16 @@ from src.backtest import (
     grid_cell_counts,
     plot_results,
 )
+from src.config import OOS_START, OOS_END, LAMBDA_CANDIDATES
+
+_OOS = {'oos_start': OOS_START, 'oos_end': OOS_END}
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 DATA_PATH   = './Data/etf_ohlcv_20160301_20251231.csv'
-OUTPUT_PATH = './output/'
+OUTPUT_PATH = './output_v2/'
 
 SECTOR_TICKERS = ['XLB', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLV', 'XLY']
 
@@ -53,7 +56,6 @@ AR_THRESHOLD     = 1.0
 
 LOOKBACK_YEARS     = 3
 LOOKBACK_DAYS      = LOOKBACK_YEARS * 252
-LAMBDA_CANDIDATES  = [5, 10, 15, 20, 25, 30]
 JM_N_STATES  = 2
 JM_MAX_ITER  = 300
 JM_TOL       = 1e-4
@@ -112,9 +114,10 @@ print(
 # 5. Backtest — 2×2 grid + binary JM baseline
 # ---------------------------------------------------------------------------
 print('\n=== Step 5: Backtest ===')
+print(f'Evaluation window: {OOS_START} → {OOS_END or "last available"}')
 
 # Binary JM baseline (bear → cash, bull → full) for comparison
-strat_ret, bnh_ret, strat_m, bnh_m = run_backtest(regime, log_rets['SPY'])
+strat_ret, bnh_ret, strat_m, bnh_m = run_backtest(regime, log_rets['SPY'], **_OOS)
 
 # 2×2 grid: JM trend × AR fragility
 grid_ret, _, grid_m, _, position = run_backtest_2x2(
@@ -122,6 +125,7 @@ grid_ret, _, grid_m, _, position = run_backtest_2x2(
     log_rets['SPY'],
     ar_zscore=ar_zscore,
     ar_threshold=AR_THRESHOLD,
+    **_OOS,
 )
 
 cell_counts = grid_cell_counts(regime, ar_zscore, ar_threshold=AR_THRESHOLD)
@@ -167,5 +171,6 @@ plot_results(
     gated_returns=grid_ret,
     gated_label='2×2 Grid',
     save_path=OUTPUT_PATH + 'equity_curves.png',
+    **_OOS,
 )
 print('Saved: equity_curves.png')

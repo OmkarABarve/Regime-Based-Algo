@@ -215,31 +215,42 @@ def compute_asymmetric_position(
     ar_zscore: pd.Series,
     ar_exit_high: float = 1.0,
     ar_entry_low: float = 0.0,
-    ar_slope_days: int = 2,
+    ar_slope_days: int = 5,
     exit_persist_days: int = 3,
-    bull_floor: float = 0.5,
 ) -> pd.Series:
     """
     Two-stage asymmetric position sizing: JM primary, AR one-sided overlay.
 
     Signals at close of day t set position held from open of t+1.
-    AR may accelerate exits (→0) but never force longs without JM bull.
+    AR may accelerate exits (1→0) but never force re-entry without JM bull
+    and AR below the entry threshold (dual-threshold hysteresis).
 
     Rules (evaluated in order each day):
-      1. JM bearish                                    → 0
-      2. JM bullish, AR high and (rising | persist)    → 0
-      3. JM bullish and AR below entry low (calm)      → 1
-      4. JM bullish (otherwise)                        → bull_floor (default 0.5)
-
-    Step 4 replaces the old "hold prior" rule so JM bull always re-enters
-    at least at ``bull_floor`` — AR only blocks full size, not participation.
+      1. JM bearish                          → 0
+      2. JM bullish, AR high and (rising or  → 0
+         persisted ``exit_persist_days``)
+      3. JM bullish and AR below entry low   → 1
+      4. Otherwise                           → hold prior position
 
     Parameters
     ----------
+    regime_series : pd.Series
+        JM regime (1=bull, 0=bear), fit on JM-only features.
+    ar_zscore : pd.Series
+        Absorption ratio z-score (fragility).
+    ar_exit_high : float
+        Exit / stay-flat threshold (upper hysteresis band).
+    ar_entry_low : float
+        Re-entry threshold (lower hysteresis band); must be < ``ar_exit_high``.
     ar_slope_days : int
-        Short lookback for AR rising exit trigger (smaller = faster exit).
-    bull_floor : float
-        Minimum exposure when JM is bull but AR has not yet calmed.
+        Lookback for AR rising trigger (exit accelerator).
+    exit_persist_days : int
+        Consecutive days AR > ``ar_exit_high`` required for persistence exit.
+
+    Returns
+    -------
+    pd.Series
+        Daily position weights in {0.0, 1.0}, index aligned to overlap.
     """
     common = regime_series.index.intersection(ar_zscore.index)
     regime = regime_series.reindex(common).astype(float)
@@ -268,7 +279,7 @@ def compute_asymmetric_position(
             elif pd.notna(ar_val) and ar_val < ar_entry_low:
                 new_pos = 1.0
             else:
-                new_pos = bull_floor
+                new_pos = prev_pos
 
         position.iloc[t] = new_pos
         prev_pos = new_pos
@@ -306,10 +317,8 @@ def run_backtest_asymmetric(
     ar_zscore: pd.Series,
     ar_exit_high: float = 1.0,
     ar_entry_low: float = 0.0,
-    ar_slope_days: int = 2,
+    ar_slope_days: int = 5,
     exit_persist_days: int = 3,
-    bull_floor: float = 0.5,
-    strategy_label: str = 'JM + AR Asymmetric',
     oos_start: str = None,
     oos_end: str = None,
 ) -> tuple:
@@ -335,7 +344,6 @@ def run_backtest_asymmetric(
         ar_entry_low=ar_entry_low,
         ar_slope_days=ar_slope_days,
         exit_persist_days=exit_persist_days,
-        bull_floor=bull_floor,
     )
     position = position.reindex(common).fillna(0.0)
 
@@ -347,149 +355,7 @@ def run_backtest_asymmetric(
     )
     position = slice_oos(position, oos_start, oos_end)
 
-    strategy_metrics = compute_metrics(strategy_returns, strategy_label)
-    bnh_metrics = compute_metrics(bnh_returns, 'Buy & Hold')
-
-    return strategy_returns, bnh_returns, strategy_metrics, bnh_metrics, position
-
-
-def compute_cascade_position(
-    regime_series: pd.Series,
-    ar_zscore: pd.Series,
-    ar_exit_high: float = 1.0,
-    ar_entry_low: float = 0.0,
-    ar_slope_days: int = 2,
-    exit_persist_days: int = 3,
-) -> pd.Series:
-    """
-    Binary AR-first cascade + JM (v6). Strict 0/1 only — no partial sizing.
-
-    Signals at close of day t set position held from open of t+1.
-    Evaluation order (AR fragility checked before JM can go long):
-
-      1. AR veto (z-score > exit_high, or high + rising | persist)  → 0
-      2. JM bearish                                                 → 0
-      3. JM bullish and not AR veto                                 → 1
-
-    Strict binary: only 0 or 1. ``ar_entry_low`` is reserved for future
-    hysteresis; long requires JM bull and no AR veto.
-    """
-    common = regime_series.index.intersection(ar_zscore.index)
-    regime = regime_series.reindex(common).astype(float)
-    ar = ar_zscore.reindex(common)
-
-    position = pd.Series(0.0, index=common)
-
-    for t in range(len(common)):
-        if t == 0:
-            position.iloc[t] = 0.0
-            continue
-
-        sig_idx = t - 1
-        jm_bull = regime.iloc[sig_idx] == 1
-        ar_val = ar.iloc[sig_idx]
-
-        ar_veto = False
-        if pd.notna(ar_val):
-            ar_veto = (
-                ar_val > ar_exit_high
-                or _ar_exit_trigger(
-                    ar, sig_idx, ar_exit_high, ar_slope_days, exit_persist_days
-                )
-            )
-
-        if ar_veto:
-            new_pos = 0.0
-        elif not jm_bull:
-            new_pos = 0.0
-        else:
-            new_pos = 1.0
-
-        position.iloc[t] = new_pos
-
-    return position
-
-
-def cascade_cell_counts(
-    regime_series: pd.Series,
-    ar_zscore: pd.Series,
-    ar_exit_high: float = 1.0,
-    ar_entry_low: float = 0.0,
-    ar_slope_days: int = 2,
-    exit_persist_days: int = 3,
-) -> pd.Series:
-    """Count days by cascade outcome (signals at t-1 for position at t)."""
-    common = regime_series.index.intersection(ar_zscore.index)
-    regime = regime_series.reindex(common).astype(float)
-    ar = ar_zscore.reindex(common)
-
-    labels = []
-    for t in range(len(common)):
-        if t == 0:
-            labels.append('cash')
-            continue
-        sig_idx = t - 1
-        jm_bull = regime.iloc[sig_idx] == 1
-        ar_val = ar.iloc[sig_idx]
-        ar_veto = False
-        if pd.notna(ar_val):
-            ar_veto = (
-                ar_val > ar_exit_high
-                or _ar_exit_trigger(
-                    ar, sig_idx, ar_exit_high, ar_slope_days, exit_persist_days
-                )
-            )
-        if ar_veto:
-            labels.append('ar_veto')
-        elif not jm_bull:
-            labels.append('jm_bear')
-        else:
-            labels.append('long')
-
-    return pd.Series(labels, index=common).value_counts()
-
-
-def run_backtest_cascade(
-    regime_series: pd.Series,
-    spy_returns: pd.Series,
-    ar_zscore: pd.Series,
-    ar_exit_high: float = 1.0,
-    ar_entry_low: float = 0.0,
-    ar_slope_days: int = 2,
-    exit_persist_days: int = 3,
-    strategy_label: str = 'v6 AR-first Cascade',
-    oos_start: str = None,
-    oos_end: str = None,
-) -> tuple:
-    """
-    Backtest binary AR-first cascade + JM-only regime.
-
-    Returns
-    -------
-    strategy_returns, bnh_returns, strategy_metrics, bnh_metrics, position
-    """
-    common = regime_series.index.intersection(spy_returns.index)
-    spy_aligned = spy_returns.loc[common]
-
-    position = compute_cascade_position(
-        regime_series,
-        ar_zscore,
-        ar_exit_high=ar_exit_high,
-        ar_entry_low=ar_entry_low,
-        ar_slope_days=ar_slope_days,
-        exit_persist_days=exit_persist_days,
-    )
-    position = position.reindex(common).fillna(0.0)
-
-    strategy_returns = position * spy_aligned
-    bnh_returns = spy_aligned.copy()
-
-    strategy_returns, bnh_returns = _apply_oos_window(
-        strategy_returns, bnh_returns, oos_start, oos_end
-    )
-    position = slice_oos(position, oos_start, oos_end)
-
-    strategy_metrics = compute_metrics(strategy_returns, strategy_label)
+    strategy_metrics = compute_metrics(strategy_returns, 'JM + AR Asymmetric')
     bnh_metrics = compute_metrics(bnh_returns, 'Buy & Hold')
 
     return strategy_returns, bnh_returns, strategy_metrics, bnh_metrics, position

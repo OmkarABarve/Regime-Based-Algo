@@ -12,8 +12,9 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
 
-LAMBDA_CANDIDATES = [5, 10, 15, 20, 25, 30, 35, 40, 50,
-                     60, 70, 80, 100, 120, 150]
+from src.config import LAMBDA_CANDIDATES as DEFAULT_LAMBDA_CANDIDATES
+
+LAMBDA_CANDIDATES = DEFAULT_LAMBDA_CANDIDATES
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +314,7 @@ def run_walk_forward_cv(
                 best_score  = score
                 best_lambda = lam
 
-        print(f"  {month_start.date()}  →  λ* = {best_lambda:>4},  Sep = {best_score:.4f}")
+        print(f"  {month_start.date()}  ->  lambda* = {best_lambda:>4},  Sep = {best_score:.4f}")
 
         # Refit with best λ on the same validation window
         best_model = JumpModel(
